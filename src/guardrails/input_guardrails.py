@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +22,34 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+# Zero-width / invisible chars attackers use to split keywords ("Ig​nore")
+_INVISIBLE_CHARS = dict.fromkeys(
+    map(ord, "​‌‍‎‏⁠⁡⁢⁣⁤﻿­᠎"),
+    None,
+)
+
+# Long inputs are a cost/DoS vector and a common way to bury injected text
+MAX_INPUT_CHARS = 2000
+
+# Extra banking vocabulary on top of core.config.ALLOWED_TOPICS
+_EXTRA_BANKING_TOPICS = [
+    "bank", "card", "vnd", "mortgage", "fee", "exchange rate", "otp",
+    "statement", "branch", "vinbank", "the ghi no", "phi", "chi nhanh",
+]
+
+
+def normalize_text(text: str) -> str:
+    """Canonicalize Unicode (NFKC), drop invisible chars, collapse whitespace."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = normalized.translate(_INVISIBLE_CHARS)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def strip_accents(text: str) -> str:
+    """Vietnamese → ASCII ("tài khoản" → "tai khoan") so topic lists match."""
+    decomposed = unicodedata.normalize("NFD", text.replace("đ", "d").replace("Đ", "D"))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 # ============================================================
@@ -52,13 +81,36 @@ def detect_injection(user_input: str) -> InputStatus:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        # Instruction override
+        r"\b(ignore|disregard|forget|override|bypass)\b.{0,40}\b(instructions?|rules?|directives?|guidelines?|prompts?|polic(y|ies))\b",
+        # Persona switch / jailbreak personas
+        r"\byou\s+are\s+now\b",
+        r"\bpretend\s+(you\s+are|to\s+be)\b",
+        r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|evil|jailbroken|uncensored)",
+        r"\b((?-i:DAN)|do\s+anything\s+now|developer\s+mode|jailbreak)\b",
+        r"\brole\s*-?\s*play\s+as\b",
+        # Prompt / config extraction
+        r"\b(system|developer|hidden|initial)\s+(prompt|instructions?|message)\b",
+        r"\b(reveal|show|print|repeat|display|dump|leak|disclose)\b.{0,30}\b(your|the)\s+(instructions?|prompt|config(uration)?|rules|internal\s+notes?)\b",
+        r"\b(translate|encode|convert)\b.{0,30}\b(your|the)\s+(instructions?|prompt|rules|config)\b",
+        # Credential extraction (not "reset my password" — only system credentials)
+        r"\b(admin|root|system|database|db|internal)\s+(password|credentials?|passwd)\b",
+        r"\b(all|your|the|system|internal)\s+(credentials|secrets)\b",
+        r"\bapi[\s_-]*keys?\b",
+        r"\b(connection\s+string|db\s*host|database\s+host)\b",
+        r"\bfill\s+in\s+(the\s+)?(blanks?|___)",
+        r"\b(base64|rot13|hex\s*encode)\b",
+        # SQL / command injection smuggled through the chat box
+        r"\b(drop|truncate)\s+table\b|\bdelete\s+from\s+\w+|\bunion\s+select\b|;\s*--",
+        # Vietnamese
+        r"bỏ\s+qua\s+(mọi|tất\s+cả|các)?\s*(hướng\s+dẫn|chỉ\s+thị|quy\s+tắc)",
+        r"tiết\s+lộ\s+(mật\s+khẩu|api|system\s*prompt|thông\s+tin\s+nội\s+bộ|hướng\s+dẫn)",
+        r"mật\s+khẩu\s+(admin|quản\s+trị|hệ\s+thống)",
     ]
 
+    text = normalize_text(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, text, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +136,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = strip_accents(normalize_text(user_input)).lower()
+    if not input_lower:
+        return "BLOCK"
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # Prefix word boundary: "hack" matches "hacking" but "kill" not "skill"
+    def mentions(topic: str) -> bool:
+        return re.search(r"\b" + re.escape(topic), input_lower) is not None
 
-    pass  # Replace with your implementation
+    if any(mentions(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(mentions(t) for t in ALLOWED_TOPICS + _EXTRA_BANKING_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -112,6 +169,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_reason: str | None = None  # "injection" | "off_topic" | None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +202,30 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        self.last_reason = None
 
-        pass  # Replace with your implementation
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            self.last_reason = "too_long"
+            return self._block_response(
+                f"Your message is too long (>{MAX_INPUT_CHARS} characters). "
+                "Please shorten your banking question."
+            )
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "injection"
+            return self._block_response(
+                "Your request was blocked by VinBank security policy "
+                "(possible prompt injection). I can only help with banking questions."
+            )
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_reason = "off_topic"
+            return self._block_response(
+                "Sorry, I can only help with VinBank banking topics such as accounts, "
+                "transfers, savings, loans and cards."
+            )
+        return None
 
 
 # ============================================================
